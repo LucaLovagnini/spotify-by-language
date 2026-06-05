@@ -4,19 +4,23 @@ Automatically organize your Spotify saved tracks into language-specific playlist
 
 ## ✨ Features
 
-- **Smart Language Detection**: Uses metadata (track names, artists, albums) and lyrics from Genius to detect song languages
+- **Smart Language Detection**: Uses lyrics (LRCLib first, Genius as fallback) and metadata (track names, artists, albums) to detect song languages
 - **Multi-Language Support**: Create playlists for multiple languages simultaneously
-- **Intelligent Fallback**: Falls back to Genius lyrics when metadata-based detection is uncertain
+- **Tiered Sources**: LRCLib → Genius → metadata, each falling back only when the previous tier can't classify the track
 - **Batch Processing**: Efficiently handles large music libraries
 - **Rate Limit Handling**: Built-in retry logic for API rate limits
 - **Resume Support**: Can resume interrupted operations
 
 ## 🚀 How It Works
 
+A 6-stage pipeline, each stage with a single responsibility:
+
 1. **Fetch Tracks**: Retrieves all your saved Spotify tracks
-2. **Language Detection**: Analyzes track metadata with weighted scoring
-3. **Lyrics Enhancement**: Uses Genius API for uncertain cases
-4. **Playlist Creation**: Automatically creates organized playlists in your Spotify account
+2. **Tag Instrumentals**: Catches structural alternate-version markers in titles (`- Instrumental`, `(Karaoke Version)`, `(... Piano Version)`)
+3. **LRCLib Classification**: Queries LRCLib for each remaining track; uses its `instrumental` boolean for instrumentals, otherwise runs language detection on the FULL lyrics body (free, no auth)
+4. **Genius Fallback**: For tracks LRCLib didn't classify, searches Genius and scrapes the lyrics page (instrumental markers or `langdetect` on a 400-char snippet)
+5. **Metadata Fallback**: For tracks neither LRCLib nor Genius could classify, falls back to weighted language detection on track name + artist + album
+6. **Playlist Creation**: Creates one playlist per language code in your Spotify account
 
 ## 📋 Prerequisites
 
@@ -79,18 +83,24 @@ Automatically organize your Spotify saved tracks into language-specific playlist
 ### Quick Start
 
 ```bash
-python orchestratory.py en,es,fr
+python orchestratory.py en,es,it,instrumental
 ```
 
-This creates playlists for English, Spanish, and French songs.
+This creates playlists for English, Spanish, Italian, and instrumental songs. Use ISO 639-1 codes (`en`, not `eng`).
 
 ### Advanced Usage
 
-````bash 
-python orchestratory.py en,es,fr,de,it 15
-````
+```bash
+python orchestratory.py en,es,fr,de,it,instrumental 15
+```
 
-Creates playlists for 5 languages, requiring at least 15 songs per playlist.
+Creates playlists for 6 buckets, requiring at least 15 songs per playlist.
+
+```bash
+python orchestratory.py en,es,fr,instrumental --reconcile
+```
+
+Adds `--reconcile`: also **removes** tracks from existing playlists whose classification has changed since the last run. Use after re-classifying to clean up stale entries. Off by default — pruning will also remove any tracks you manually added to a `My <LANG> Songs` playlist outside this tool.
 
 ### Individual Modules
 You can also run individual stages:
@@ -99,17 +109,36 @@ You can also run individual stages:
 # Stage 1: Fetch Spotify tracks
 python save_spotify_tracks.py
 
-# Stage 2: Detect languages
-python detect_language.py
+# Stage 2: Tag instrumentals by title heuristic
+python tag_instrumentals.py
 
-# Stage 3: Enhance with Genius lyrics
+# Stage 3: LRCLib classification (resumable, free, no auth)
+python fetch_lrclib.py
+
+# Stage 4: Genius fallback for tracks LRCLib missed (resumable)
 python fetch_genius_lyrics.py
 
-# Stage 4: Create playlists
-python create_playlist.py data/language_identified_genius.json en,es,fr
+# Stage 5: Metadata fallback for tracks neither source could classify
+python detect_language.py
+
+# Stage 6: Create playlists
+python create_playlist.py data/language_identified_genius.json en,es,fr,instrumental [--reconcile]
 ```
 
 ## 📊 Language Detection Algorithm
+
+### How a track's `final_language` is decided
+
+LRCLib is the primary lyrics source; Genius is a fallback when LRCLib doesn't have the track; metadata is the last resort. Each track's language is set **exactly once**, by whichever stage first classifies it:
+
+1. **Title marker** (stage 2) → `instrumental`, e.g. `Still D.R.E. - Instrumental Version`
+2. **LRCLib `instrumental: true`** (stage 3) → `instrumental` (real, data-model-enforced signal)
+3. **LRCLib full lyrics** (stage 3) → language detected by running `langdetect` on the complete lyrics body (no snippet truncation)
+4. **Genius "this song is an instrumental" marker** (stage 4) → `instrumental`, e.g. Brian Eno's *Lanzarote*
+5. **Genius lyrics** (stage 4) → language detected by running `langdetect` on a 400-char snippet
+6. **Metadata fallback** (stage 5) → weighted `langdetect` on name (0.5) + artist (0.3) + album (0.2), as a last resort when neither source helps
+
+Stage 4 also filters its Genius hits: rejects translation pages (e.g. `(Traduction Française)`, `(Türkçe Çeviri)`) and rejects hits whose artist doesn't fuzzy-match the Spotify artist. This avoids cases where Genius's search returns a podcast review or a French translation as the top hit.
 
 ### 📋 Supported Languages
 The system supports all languages detected by the `langdetect` library, including:
@@ -123,29 +152,30 @@ The system supports all languages detected by the `langdetect` library, includin
 - **ja** — Japanese
 - **ko** — Korean
 - **zh** — Chinese
+- And the special bucket **instrumental** for tracks without lyrics
 - And many more...
 
-### 🚩Known Limitations
+### 🚩 Known Limitations
 
-- **Instrumental tracks** (i.e., tracks without lyrics) are currently classified as `unknown`. Support for explicit 
-instrumental detection is planned via the `tag_instrumentals` step in a future release.
+- **Tracks neither LRCLib nor Genius indexes** fall back to metadata-based detection, which is a weak proxy. The `source` field in the output JSON shows which tier classified each track: `lrclib`, `lrclib_instrumental`, `genius`, `genius_instrumental`, or `metadata`.
 
-- **Metadata-based language detection may be inaccurate.** The initial classification step runs `langdetect` on a 
-combination of track title, artist name, and album name. This can lead to incorrect results when the title language 
-differs from the lyric language (e.g., *Madonna – La Isla Bonita* is classified as `es` based on the title, 
-even though the lyrics are primarily in English).
+- **Metadata-based language detection can be misleading** when title language differs from lyric language (e.g., *Madonna – La Isla Bonita* would be classified as `es` based on the title, even though the lyrics are primarily in English). The pipeline only falls back to metadata when both lyrics sources returned nothing — most tracks get lyrics-validated.
+
+- **Filler-vocable-heavy songs can fool `langdetect`** even with full lyrics. Example: Lin Cortés *Novia Moderna* has 5 short lines of Spanish followed by a long tail of `Lele-lelé` syllables; langdetect on the full LRCLib lyrics returns `fr: 0.43, it: 0.42, ca: 0.15` — Spanish doesn't crack the top 3. Raising the confidence threshold and falling through to metadata is one mitigation; swapping to a more robust detector (fasttext, lingua-py) is another.
 
 ## ⚙️ Configuration
 ### Language Detection Settings
-You can modify these in : `config.py`
-- Minimum confidence (default: 0.80) `LANGUAGE_CONF_THRESHOLD`
-- Field importance weights `WEIGHTS`
-- Minimum text length `MIN_TEXT_LEN`
+You can modify these in `config.py`:
+- Minimum confidence for the metadata fallback (default: 0.80) — `LANGUAGE_CONF_THRESHOLD`
+- Field weights for the metadata fallback — `FIELD_WEIGHTS`
+- Minimum text length before `langdetect` runs — `MIN_TEXT_LEN`
+- Flush interval (Spotify pagination) — `FLUSH_INTERVAL`
 
 ### Rate Limiting
-Built-in rate limiting with exponential backoff:
-- Spotify: 50 songs fetched per request
-- Genius: 1-second between requests, with progressive delays on rate limits
+Built-in rate limiting with retries:
+- Spotify: 50 songs per page; stage 6 honors `Retry-After` on 429 and retries 5xx
+- LRCLib: no throttle in practice (measured ~31 req/min with 0 errors); 429 backoff handler defensive only
+- Genius: 1-second between requests, with linear backoff (10s × attempt) on 429
 
 ## 🔍 Troubleshooting
 ### Common Issues
@@ -162,8 +192,11 @@ pip install -r requirements.txt
 - For Spotify, reduce the number of fetched songs per request through `FLUSH_INTERVAL`
 
 **"Permission denied" for playlists**
-- Ensure your Spotify app has the correct scopes
-- Re-authenticate by deleting file `.cache`
+- Ensure your Spotify app has the correct scopes (stage 1 needs `user-library-read`; stage 6 needs `playlist-read-private playlist-modify-public playlist-modify-private` — the read scope is required so the script can detect already-existing playlists and avoid creating duplicates)
+- Re-authenticate by deleting file `.cache` (also required after any scope change)
+
+**Duplicate "My &lt;LANG&gt; Songs" playlists appear after each run**
+- This happens when `playlist-read-private` is missing from the scope: the script can't see its own previous (private) playlists and creates a new one every time. The scope is included by default now; if you upgraded from an older version, delete `.cache` to force a fresh auth with the new scope.
 
 ## ⚠️ Disclaimer
 - This tool accesses your Spotify library and creates playlists
@@ -173,8 +206,9 @@ pip install -r requirements.txt
 
 ## 🙏 Acknowledgments
 - [Spotipy](https://spotipy.readthedocs.io/) — Spotify Web API wrapper
+- [LRCLib](https://lrclib.net/) — Free synced-lyrics database with a reliable `instrumental` flag (no auth, no rate limit)
+- [Genius API](https://docs.genius.com/) — Lyrics and song information (used as fallback)
 - [langdetect](https://github.com/Mimino666/langdetect) — Language detection library
-- [Genius API](https://docs.genius.com/) — Lyrics and song information
-- [BeautifulSoup](https://www.crummy.com/software/BeautifulSoup/) — Web scraping
+- [BeautifulSoup](https://www.crummy.com/software/BeautifulSoup/) — Web scraping (Genius lyrics pages)
 
 Made with ❤️ for music lovers who appreciate linguistic diversity in their playlists!
